@@ -186,6 +186,156 @@ class ERPNextClient {
       }
     }
   }
+
+  // Generic RPC method caller for ERPNext/Frappe methods
+  async callMethod(methodPath: string, params: Record<string, any>): Promise<any> {
+    try {
+      const response = await this.axiosInstance.post(`/api/method/${methodPath}`, params);
+      return response.data.message || response.data;
+    } catch (error: any) {
+      throw new Error(`Failed to call method ${methodPath}: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  // Get all companies with parent-subsidiary relationships
+  async getCompanies(): Promise<any[]> {
+    try {
+      return await this.getDocList('Company', {}, ['name', 'abbr', 'parent_company', 'default_currency']);
+    } catch (error: any) {
+      throw new Error(`Failed to get companies: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  // Get account tree children for a company (one level at a time)
+  async getAccountTree(company: string, parent?: string, includeBalances?: boolean): Promise<any> {
+    try {
+      const params: Record<string, any> = {
+        doctype: 'Account',
+        company: company
+      };
+
+      if (parent === undefined || parent === '') {
+        params.parent = '';
+        params.is_root = true;
+      } else {
+        params.parent = parent;
+      }
+
+      const children = await this.callMethod('frappe.desk.treeview.get_children', params);
+
+      // includeBalances parameter reserved for Phase 2 enhancement
+      return children;
+    } catch (error: any) {
+      throw new Error(`Failed to get account tree for ${company}: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  // Get account balance as of a specific date
+  async getAccountBalance(account: string, date?: string): Promise<any> {
+    try {
+      const balanceDate = date || new Date().toISOString().split('T')[0];
+
+      const params = {
+        account: account,
+        date: balanceDate
+      };
+
+      return await this.callMethod('erpnext.accounts.utils.get_balance_on', params);
+    } catch (error: any) {
+      throw new Error(`Failed to get balance for ${account}: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  // Get trial balance for a company and date range (simplified wrapper around run_report)
+  async getTrialBalance(company: string, asOfDate?: string, showZeroBalances: boolean = false): Promise<any> {
+    try {
+      const date = asOfDate || new Date().toISOString().split('T')[0];
+
+      // Determine fiscal year from date (simple assumption: fiscal year = calendar year)
+      const fiscalYear = new Date(date).getFullYear().toString();
+
+      const filters = {
+        company: company,
+        fiscal_year: fiscalYear,
+        from_date: `${fiscalYear}-01-01`,
+        to_date: date,
+        with_period_closing_entry: 0
+      };
+
+      const result = await this.runReport('Trial Balance', filters);
+
+      // Filter out zero balances if requested
+      if (!showZeroBalances && result.result) {
+        result.result = result.result.filter((row: any) => {
+          const debit = parseFloat(row.debit) || 0;
+          const credit = parseFloat(row.credit) || 0;
+          return debit !== 0 || credit !== 0;
+        });
+      }
+
+      return result;
+    } catch (error: any) {
+      throw new Error(`Failed to get trial balance for ${company}: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  // Search accounts by number or name (fuzzy search)
+  async searchAccounts(company: string, query: string, limit: number = 10): Promise<any[]> {
+    try {
+      // Search in both account_name and account_number fields using 'like' operator
+      const filters = {
+        company: company,
+        // Use OR logic: match either name or number
+        name: ['like', `%${query}%`]
+      };
+
+      const accounts = await this.getDocList(
+        'Account',
+        filters,
+        ['name', 'account_name', 'account_number', 'account_type', 'is_group', 'parent_account'],
+        limit
+      );
+
+      return accounts;
+    } catch (error: any) {
+      throw new Error(`Failed to search accounts for ${company}: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  // List accounts filtered by type or root type
+  async listAccountsByType(
+    company: string,
+    accountType?: string,
+    rootType?: string,
+    includeGroups: boolean = false
+  ): Promise<any[]> {
+    try {
+      const filters: Record<string, any> = { company: company };
+
+      if (accountType) {
+        filters.account_type = accountType;
+      }
+
+      if (rootType) {
+        filters.root_type = rootType;
+      }
+
+      if (!includeGroups) {
+        filters.is_group = 0;
+      }
+
+      const accounts = await this.getDocList(
+        'Account',
+        filters,
+        ['name', 'account_name', 'account_number', 'account_type', 'root_type', 'is_group'],
+        0  // No limit, get all matching accounts
+      );
+
+      return accounts;
+    } catch (error: any) {
+      throw new Error(`Failed to list accounts by type for ${company}: ${error?.message || 'Unknown error'}`);
+    }
+  }
 }
 
 // Cache for doctype metadata
@@ -232,6 +382,12 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
       name: "All DocTypes",
       mimeType: "application/json",
       description: "List of all available DocTypes in the ERPNext instance"
+    },
+    {
+      uri: "erpnext://companies",
+      name: "Company List",
+      mimeType: "application/json",
+      description: "List of all companies with parent-subsidiary relationships"
     }
   ];
 
@@ -271,8 +427,19 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const uri = request.params.uri;
   let result: any;
 
-  // Handle special resource: erpnext://DocTypes (list of all doctypes)
-  if (uri === "erpnext://DocTypes") {
+  // Handle special resource: erpnext://companies
+  if (uri === "erpnext://companies") {
+    try {
+      const companies = await erpnext.getCompanies();
+      result = { companies };
+    } catch (error: any) {
+      throw new McpError(
+        ErrorCode.InternalError,
+        `Failed to fetch companies: ${error?.message || 'Unknown error'}`
+      );
+    }
+  } else if (uri === "erpnext://DocTypes") {
+    // Handle special resource: erpnext://DocTypes (list of all doctypes)
     try {
       const doctypes = await erpnext.getAllDocTypes();
       result = { doctypes };
@@ -288,7 +455,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     if (documentMatch) {
       const doctype = decodeURIComponent(documentMatch[1]);
       const name = decodeURIComponent(documentMatch[2]);
-      
+
       try {
         result = await erpnext.getDocument(doctype, name);
       } catch (error: any) {
@@ -433,6 +600,124 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             }
           },
           required: ["report_name"]
+        }
+      },
+      {
+        name: "get_companies",
+        description: "List all companies in ERPNext with parent-subsidiary relationships",
+        inputSchema: {
+          type: "object",
+          properties: {}
+        }
+      },
+      {
+        name: "get_account_tree",
+        description: "Get hierarchical chart of accounts tree for a company",
+        inputSchema: {
+          type: "object",
+          properties: {
+            company: {
+              type: "string",
+              description: "Company name (e.g., 'Personal', 'LLC')"
+            },
+            parent_account: {
+              type: "string",
+              description: "Parent account name to get children of (leave empty for root accounts)"
+            },
+            include_balances: {
+              type: "boolean",
+              description: "Include current balances for accounts (not implemented in Phase 1)"
+            }
+          },
+          required: ["company"]
+        }
+      },
+      {
+        name: "get_account_balance",
+        description: "Get balance for an account as of a specific date",
+        inputSchema: {
+          type: "object",
+          properties: {
+            account: {
+              type: "string",
+              description: "Full account name including company suffix (e.g., '1111 - Checking - PMA - Personal')"
+            },
+            date: {
+              type: "string",
+              description: "Date for balance in YYYY-MM-DD format (optional, defaults to today)"
+            }
+          },
+          required: ["account"]
+        }
+      },
+      {
+        name: "get_trial_balance",
+        description: "Get trial balance report for a company as of a specific date",
+        inputSchema: {
+          type: "object",
+          properties: {
+            company: {
+              type: "string",
+              description: "Company name (e.g., 'Personal', 'LLC')"
+            },
+            as_of_date: {
+              type: "string",
+              description: "Date for trial balance in YYYY-MM-DD format (optional, defaults to today)"
+            },
+            show_zero_balances: {
+              type: "boolean",
+              description: "Include accounts with zero balances (optional, defaults to false)"
+            }
+          },
+          required: ["company"]
+        }
+      },
+      {
+        name: "search_accounts",
+        description: "Search accounts by account number or name (fuzzy search)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            company: {
+              type: "string",
+              description: "Company name (e.g., 'Personal', 'LLC')"
+            },
+            query: {
+              type: "string",
+              description: "Search term (account number like '1111' or partial name like 'Checking')"
+            },
+            limit: {
+              type: "number",
+              description: "Maximum number of results to return (optional, defaults to 10)"
+            }
+          },
+          required: ["company", "query"]
+        }
+      },
+      {
+        name: "list_accounts_by_type",
+        description: "List accounts filtered by account type or root type",
+        inputSchema: {
+          type: "object",
+          properties: {
+            company: {
+              type: "string",
+              description: "Company name (e.g., 'Personal', 'LLC')"
+            },
+            account_type: {
+              type: "string",
+              description: "Filter by account type: Bank, Cash, Receivable, Payable, Stock, Tax, etc. (optional)"
+            },
+            root_type: {
+              type: "string",
+              description: "Filter by root type: Asset, Liability, Equity, Income, Expense (optional)"
+            },
+            include_groups: {
+              type: "boolean",
+              description: "Include group/parent accounts (optional, defaults to false)"
+            }
+          },
+          required: ["company"]
         }
       }
     ]
@@ -695,7 +980,246 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
     }
-      
+
+    case "get_companies": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      try {
+        const companies = await erpnext.getCompanies();
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(companies, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to get companies: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "get_account_tree": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const company = String(request.params.arguments?.company);
+      const parentAccount = request.params.arguments?.parent_account as string | undefined;
+      const includeBalances = request.params.arguments?.include_balances as boolean | undefined;
+
+      if (!company) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Company is required"
+        );
+      }
+
+      try {
+        const tree = await erpnext.getAccountTree(company, parentAccount, includeBalances);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(tree, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to get account tree for ${company}: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "get_account_balance": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const account = String(request.params.arguments?.account);
+      const date = request.params.arguments?.date as string | undefined;
+
+      if (!account) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Account is required"
+        );
+      }
+
+      try {
+        const balance = await erpnext.getAccountBalance(account, date);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              account,
+              balance,
+              date: date || new Date().toISOString().split('T')[0]
+            }, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to get balance for ${account}: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "get_trial_balance": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const company = String(request.params.arguments?.company);
+      const asOfDate = request.params.arguments?.as_of_date as string | undefined;
+      const showZeroBalances = request.params.arguments?.show_zero_balances as boolean | undefined || false;
+
+      if (!company) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Company is required"
+        );
+      }
+
+      try {
+        const trialBalance = await erpnext.getTrialBalance(company, asOfDate, showZeroBalances);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(trialBalance, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to get trial balance for ${company}: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "search_accounts": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const company = String(request.params.arguments?.company);
+      const query = String(request.params.arguments?.query);
+      const limit = request.params.arguments?.limit as number | undefined || 10;
+
+      if (!company || !query) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Company and query are required"
+        );
+      }
+
+      try {
+        const accounts = await erpnext.searchAccounts(company, query, limit);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(accounts, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to search accounts for ${company}: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "list_accounts_by_type": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const company = String(request.params.arguments?.company);
+      const accountType = request.params.arguments?.account_type as string | undefined;
+      const rootType = request.params.arguments?.root_type as string | undefined;
+      const includeGroups = request.params.arguments?.include_groups as boolean | undefined || false;
+
+      if (!company) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Company is required"
+        );
+      }
+
+      try {
+        const accounts = await erpnext.listAccountsByType(company, accountType, rootType, includeGroups);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(accounts, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to list accounts by type for ${company}: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+
     default:
       throw new McpError(
         ErrorCode.MethodNotFound,
