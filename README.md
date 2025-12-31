@@ -9,15 +9,35 @@ This is a TypeScript-based MCP server that provides integration with ERPNext/Fra
 ### Resources
 - Access ERPNext documents via `erpnext://{doctype}/{name}` URIs
 - JSON format for structured data access
+- Company list and hierarchy (`erpnext://companies`)
 
-### Tools
-- `authenticate_erpnext` - Authenticate with ERPNext using username and password
+### Core Tools
+- `get_doctypes` - Get a list of all available DocTypes
+- `get_doctype_fields` - Get fields list for a specific DocType
 - `get_documents` - Get a list of documents for a specific doctype
 - `create_document` - Create a new document in ERPNext
 - `update_document` - Update an existing document in ERPNext
 - `run_report` - Run an ERPNext report
-- `get_doctype_fields` - Get fields list for a specific DocType
-- `get_doctypes` - Get a list of all available DocTypes
+
+### Accounting Tools
+- `get_companies` - List all companies with parent-subsidiary relationships
+- `get_account_tree` - Get hierarchical chart of accounts
+- `get_account_balance` - Get account balance as of a specific date
+- `get_trial_balance` - Get trial balance report for a company
+- `search_accounts` - Search accounts by number or name
+- `list_accounts_by_type` - List accounts filtered by type (Asset, Liability, Income, Expense, etc.)
+
+### Bank Import & Reconciliation Tools
+- `get_bank_accounts` - Get list of bank accounts
+- `search_bank_transactions` - Search bank transactions with flexible filters
+- `batch_import_bank_transactions` - Batch import from CSV/Excel using ERPNext's native API
+
+### Journal Entry Tools
+- `validate_journal_entry` - Validate journal entry (check debits = credits)
+- `create_journal_entry` - Create journal entry with validation
+- `submit_journal_entry` - Submit (post) a draft journal entry
+
+See [Bank Import Tools Documentation](docs/bank-import-tools.md) for detailed usage of bank and journal entry features.
 
 ## Configuration
 
