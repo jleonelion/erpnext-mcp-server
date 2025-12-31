@@ -36,6 +36,7 @@ This is a TypeScript-based MCP server that provides integration with ERPNext/Fra
 - `validate_journal_entry` - Validate journal entry (check debits = credits)
 - `create_journal_entry` - Create journal entry with validation
 - `submit_journal_entry` - Submit (post) a draft journal entry
+- `batch_create_journal_entries` - Batch create multiple journal entries with validation and error handling
 
 See [Bank Import Tools Documentation](docs/bank-import-tools.md) for detailed usage of bank and journal entry features.
 

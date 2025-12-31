@@ -207,6 +207,127 @@ Confirmation of submission.
 
 **Note:** Once submitted, journal entries cannot be edited - only cancelled and recreated.
 
+---
+
+### 7. `batch_create_journal_entries`
+
+Batch create multiple journal entries with validation and error handling. This tool is ideal for importing expenses, processing multiple paychecks, or creating recurring entries.
+
+**Parameters:**
+- `entries` (required): Array of journal entry objects
+- `auto_submit` (optional): Automatically submit (post) entries after creation (defaults to `false`)
+- `stop_on_error` (optional): Stop processing on first error instead of continuing (defaults to `false`)
+
+**Example - Batch import expenses:**
+```json
+{
+  "entries": [
+    {
+      "posting_date": "2025-02-15",
+      "company": "Personal",
+      "user_remark": "Groceries - Whole Foods",
+      "accounts": [
+        {
+          "account": "5410 - Groceries - Personal",
+          "debit_in_account_currency": 125.50
+        },
+        {
+          "account": "2112 - American Express - Personal",
+          "credit_in_account_currency": 125.50
+        }
+      ]
+    },
+    {
+      "posting_date": "2025-02-16",
+      "company": "Personal",
+      "user_remark": "Gas - Shell Station",
+      "accounts": [
+        {
+          "account": "5310 - Fuel - Personal",
+          "debit_in_account_currency": 45.00
+        },
+        {
+          "account": "2111 - Chase United - Personal",
+          "credit_in_account_currency": 45.00
+        }
+      ]
+    }
+  ],
+  "auto_submit": true,
+  "stop_on_error": false
+}
+```
+
+**Example - Create monthly paycheck entries:**
+```json
+{
+  "entries": [
+    {
+      "posting_date": "2025-01-15",
+      "company": "Personal",
+      "user_remark": "January paycheck",
+      "accounts": [
+        {"account": "4111 - Salary - Personal", "credit_in_account_currency": 5000.00},
+        {"account": "5111 - Federal Withholding - Personal", "debit_in_account_currency": 800.00},
+        {"account": "5113 - Social Security - Personal", "debit_in_account_currency": 310.00},
+        {"account": "5114 - Medicare - Personal", "debit_in_account_currency": 72.50},
+        {"account": "5131 - 401(k) Employee - Personal", "debit_in_account_currency": 317.50},
+        {"account": "1111 - Checking - PMA - Personal", "debit_in_account_currency": 3500.00}
+      ]
+    },
+    {
+      "posting_date": "2025-02-15",
+      "company": "Personal",
+      "user_remark": "February paycheck",
+      "accounts": [
+        {"account": "4111 - Salary - Personal", "credit_in_account_currency": 5000.00},
+        {"account": "5111 - Federal Withholding - Personal", "debit_in_account_currency": 800.00},
+        {"account": "5113 - Social Security - Personal", "debit_in_account_currency": 310.00},
+        {"account": "5114 - Medicare - Personal", "debit_in_account_currency": 72.50},
+        {"account": "5131 - 401(k) Employee - Personal", "debit_in_account_currency": 317.50},
+        {"account": "1111 - Checking - PMA - Personal", "debit_in_account_currency": 3500.00}
+      ]
+    }
+  ],
+  "auto_submit": false,
+  "stop_on_error": true
+}
+```
+
+**Returns:**
+Detailed result object with:
+- `success_count`: Number of entries created successfully
+- `error_count`: Number of entries that failed
+- `created_entries`: Array of created entries with names, dates, amounts, and submission status
+- `errors`: Array of errors with entry index, error message, and validation details
+
+**Workflow:**
+1. For each entry:
+   - Validates structure and balances (debits = credits)
+   - Creates the journal entry via REST API
+   - Optionally submits the entry if `auto_submit: true`
+   - Captures success or error details
+2. If `stop_on_error: false` (default): Continues processing all entries even if some fail
+3. If `stop_on_error: true`: Aborts batch on first error
+4. Returns comprehensive result with per-entry status
+
+**Performance:**
+- Approximately 100-200ms per entry (network latency)
+- 50 entries: ~5-10 seconds
+- Acceptable for typical personal bookkeeping batch sizes
+
+**Error Handling:**
+- **Validation errors**: Caught before API call, entry not created
+- **Creation errors**: ERPNext rejects entry, error details included in results
+- **Submission errors**: Entry created as draft but submission failed
+- Partial success: Some entries may succeed while others fail (unless `stop_on_error: true`)
+
+**Best Practices:**
+- Use `auto_submit: false` for first-time imports to review drafts
+- Set `stop_on_error: true` when testing to catch issues early
+- Review error details and fix failed entries before retrying
+- Keep batches under 100 entries for reasonable response times
+
 ## Integration with ERPNext API
 
 These tools use ERPNext's native APIs:
@@ -216,12 +337,18 @@ These tools use ERPNext's native APIs:
    - Same backend as UI import feature
    - Auto-submits transactions
 
-2. **Journal Entry Creation:**
+2. **Single Journal Entry Creation:**
    - API: Standard document creation (`/api/resource/Journal Entry`)
    - Validation done client-side before submission
    - Submit via `frappe.client.submit`
 
-3. **Bank Transaction Search:**
+3. **Batch Journal Entry Creation:**
+   - Pattern: Loop-and-collect using standard REST API
+   - Each entry validated and created individually
+   - No ERPNext server modification required
+   - Detailed per-entry error reporting
+
+4. **Bank Transaction Search:**
    - API: Standard document listing (`/api/resource/Bank Transaction`)
    - Client-side amount filtering for precise ranges
    - Date range filtering via Frappe query syntax
@@ -229,12 +356,15 @@ These tools use ERPNext's native APIs:
 ## Best Practices
 
 1. **Always validate** journal entries before creation
-2. **Search with date tolerance** (±3 days) for bank matching
-3. **Check status = "Unreconciled"** when matching EveryDollar entries
-4. **Use exact account names** including company suffix
-5. **Round amounts** to 2 decimal places to avoid floating-point issues
-6. **Review discrepancies** before batch creation
-7. **Test with draft entries** before submitting
+2. **Use batch operations** for importing 10+ entries to save time
+3. **Start with auto_submit: false** when batch importing to review drafts first
+4. **Search with date tolerance** (±3 days) for bank matching
+5. **Check status = "Unreconciled"** when matching entries
+6. **Use exact account names** including company suffix
+7. **Round amounts** to 2 decimal places to avoid floating-point issues
+8. **Review batch results** carefully - check both success and error counts
+9. **Keep batches under 100 entries** for reasonable response times
+10. **Use stop_on_error: true** during testing to catch structural issues early
 
 ## Future Enhancements
 

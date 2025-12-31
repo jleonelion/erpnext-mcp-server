@@ -26,7 +26,8 @@ import {
   BankTransaction,
   BankAccount,
   JournalEntry,
-  JournalEntryValidation
+  JournalEntryValidation,
+  BatchJournalEntryResult
 } from './types.js';
 
 // ERPNext API client configuration
@@ -552,6 +553,96 @@ class ERPNextClient {
       throw new Error(`Failed to submit journal entry ${journalEntryName}: ${error?.message || 'Unknown error'}`);
     }
   }
+
+  // Batch create journal entries with validation and error handling
+  async batchCreateJournalEntries(
+    entries: JournalEntry[],
+    autoSubmit: boolean = false,
+    stopOnError: boolean = false
+  ): Promise<BatchJournalEntryResult> {
+    const result: BatchJournalEntryResult = {
+      success_count: 0,
+      error_count: 0,
+      created_entries: [],
+      errors: []
+    };
+
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index];
+
+      try {
+        // Validate the journal entry first
+        const validation = await this.validateJournalEntry(entry);
+
+        if (!validation.is_valid) {
+          // Validation failed
+          result.error_count++;
+          result.errors.push({
+            index,
+            entry,
+            error: `Validation failed: ${validation.errors.join(', ')}`,
+            validation_result: validation
+          });
+
+          if (stopOnError) {
+            throw new Error(`Stopped at entry ${index} due to validation failure`);
+          }
+          continue;
+        }
+
+        // Create the journal entry
+        const created = await this.createDocument('Journal Entry', entry);
+        const entryName = created.data?.name || created.name;
+
+        if (!entryName) {
+          throw new Error('Journal entry created but no name returned');
+        }
+
+        // Optionally submit the entry
+        let submitted = false;
+        if (autoSubmit) {
+          try {
+            await this.submitJournalEntry(entryName);
+            submitted = true;
+          } catch (submitError: any) {
+            // Entry created but submission failed - still count as partial success
+            result.errors.push({
+              index,
+              entry,
+              error: `Entry created as ${entryName} but submission failed: ${submitError?.message || 'Unknown error'}`,
+              validation_result: validation
+            });
+          }
+        }
+
+        // Record success
+        result.success_count++;
+        result.created_entries.push({
+          index,
+          name: entryName,
+          posting_date: entry.posting_date,
+          total_debit: validation.total_debit,
+          total_credit: validation.total_credit,
+          submitted
+        });
+
+      } catch (error: any) {
+        // Creation or other error
+        result.error_count++;
+        result.errors.push({
+          index,
+          entry,
+          error: error?.message || 'Unknown error during creation'
+        });
+
+        if (stopOnError) {
+          throw new Error(`Stopped at entry ${index}: ${error?.message || 'Unknown error'}`);
+        }
+      }
+    }
+
+    return result;
+  }
 }
 
 // Cache for doctype metadata
@@ -951,7 +1042,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "search_bank_transactions",
-        description: "Search bank transactions with various filters for matching against EveryDollar entries or reconciliation",
+        description: "Search bank transactions with various filters for matching against entries or reconciliation",
         inputSchema: {
           type: "object",
           properties: {
@@ -1061,6 +1152,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             }
           },
           required: ["journal_entry_name"]
+        }
+      },
+      {
+        name: "batch_create_journal_entries",
+        description: "Batch create multiple journal entries with validation and error handling. Each entry is validated before creation, and results include detailed success/error information.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            entries: {
+              type: "array",
+              items: {
+                type: "object",
+                description: "Journal entry object with posting_date, company, accounts array, and optional user_remark"
+              },
+              description: "Array of journal entries to create"
+            },
+            auto_submit: {
+              type: "boolean",
+              description: "Automatically submit (post) journal entries after creation (optional, defaults to false)"
+            },
+            stop_on_error: {
+              type: "boolean",
+              description: "Stop batch processing on first error instead of continuing (optional, defaults to false)"
+            }
+          },
+          required: ["entries"]
         }
       }
     ]
@@ -1820,6 +1937,76 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: "text",
             text: `Failed to submit journal entry ${journalEntryName}: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "batch_create_journal_entries": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const entries = request.params.arguments?.entries as JournalEntry[] | undefined;
+      const autoSubmit = (request.params.arguments?.auto_submit as boolean | undefined) || false;
+      const stopOnError = (request.params.arguments?.stop_on_error as boolean | undefined) || false;
+
+      if (!entries || entries.length === 0) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "entries array is required and must not be empty"
+        );
+      }
+
+      try {
+        const result = await erpnext.batchCreateJournalEntries(entries, autoSubmit, stopOnError);
+
+        // Build a formatted summary
+        let summary = `Batch Journal Entry Creation Complete:\n\n`;
+        summary += `✓ Success: ${result.success_count}\n`;
+        summary += `✗ Errors: ${result.error_count}\n\n`;
+
+        if (result.created_entries.length > 0) {
+          summary += `Created Entries:\n`;
+          result.created_entries.forEach(entry => {
+            const status = entry.submitted ? '(Submitted)' : '(Draft)';
+            summary += `  [${entry.index}] ${entry.name} - ${entry.posting_date} - Debit: ${entry.total_debit.toFixed(2)}, Credit: ${entry.total_credit.toFixed(2)} ${status}\n`;
+          });
+          summary += `\n`;
+        }
+
+        if (result.errors.length > 0) {
+          summary += `Errors:\n`;
+          result.errors.forEach(error => {
+            summary += `  [${error.index}] ${error.error}\n`;
+            if (error.validation_result && error.validation_result.errors.length > 0) {
+              summary += `    Validation: ${error.validation_result.errors.join(', ')}\n`;
+            }
+          });
+          summary += `\n`;
+        }
+
+        summary += `\nDetailed Results:\n${JSON.stringify(result, null, 2)}`;
+
+        return {
+          content: [{
+            type: "text",
+            text: summary
+          }],
+          isError: result.error_count > 0 && stopOnError
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to batch create journal entries: ${error?.message || 'Unknown error'}`
           }],
           isError: true
         };

@@ -100,3 +100,33 @@ export interface BankImportResult {
     data: any;
   }>;
 }
+
+// Batch Journal Entry Types
+export interface BatchJournalEntryInput {
+  entries: JournalEntry[];
+  auto_submit?: boolean;
+  stop_on_error?: boolean;
+}
+
+export interface BatchJournalEntryCreatedEntry {
+  index: number;
+  name: string;
+  posting_date: string;
+  total_debit: number;
+  total_credit: number;
+  submitted: boolean;
+}
+
+export interface BatchJournalEntryError {
+  index: number;
+  entry: JournalEntry;
+  error: string;
+  validation_result?: JournalEntryValidation;
+}
+
+export interface BatchJournalEntryResult {
+  success_count: number;
+  error_count: number;
+  created_entries: BatchJournalEntryCreatedEntry[];
+  errors: BatchJournalEntryError[];
+}
