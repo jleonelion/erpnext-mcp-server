@@ -22,6 +22,12 @@ import {
   ReadResourceRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance } from "axios";
+import {
+  BankTransaction,
+  BankAccount,
+  JournalEntry,
+  JournalEntryValidation
+} from './types.js';
 
 // ERPNext API client configuration
 class ERPNextClient {
@@ -334,6 +340,216 @@ class ERPNextClient {
       return accounts;
     } catch (error: any) {
       throw new Error(`Failed to list accounts by type for ${company}: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  // Get all bank accounts for a company
+  async getBankAccounts(company?: string): Promise<BankAccount[]> {
+    try {
+      const filters: Record<string, any> = {};
+
+      if (company) {
+        filters.company = company;
+      }
+
+      const accounts = await this.getDocList(
+        'Bank Account',
+        filters,
+        ['name', 'account_name', 'account', 'bank', 'is_company_account', 'company', 'bank_account_no', 'iban', 'is_default', 'disabled'],
+        0
+      );
+
+      return accounts as BankAccount[];
+    } catch (error: any) {
+      throw new Error(`Failed to get bank accounts: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  // Search bank transactions with filters
+  async searchBankTransactions(
+    bankAccount?: string,
+    company?: string,
+    status?: string,
+    fromDate?: string,
+    toDate?: string,
+    minAmount?: number,
+    maxAmount?: number
+  ): Promise<BankTransaction[]> {
+    try {
+      const filters: Record<string, any> = {};
+
+      if (bankAccount) {
+        filters.bank_account = bankAccount;
+      }
+
+      if (company) {
+        filters.company = company;
+      }
+
+      if (status) {
+        filters.status = status;
+      }
+
+      if (fromDate) {
+        filters.date = ['>=', fromDate];
+      }
+
+      if (toDate) {
+        if (filters.date) {
+          filters.date = ['between', [fromDate, toDate]];
+        } else {
+          filters.date = ['<=', toDate];
+        }
+      }
+
+      const transactions = await this.getDocList(
+        'Bank Transaction',
+        filters,
+        ['name', 'date', 'deposit', 'withdrawal', 'description', 'reference_number', 'transaction_id', 'bank_account', 'company', 'currency', 'status'],
+        0
+      );
+
+      // Filter by amount if specified (client-side filtering since ERPNext doesn't support range queries easily)
+      let filtered = transactions as BankTransaction[];
+
+      if (minAmount !== undefined || maxAmount !== undefined) {
+        filtered = filtered.filter(t => {
+          const amount = t.deposit || t.withdrawal || 0;
+          if (minAmount !== undefined && amount < minAmount) return false;
+          if (maxAmount !== undefined && amount > maxAmount) return false;
+          return true;
+        });
+      }
+
+      return filtered;
+    } catch (error: any) {
+      throw new Error(`Failed to search bank transactions: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  // Batch import bank transactions using ERPNext's create_bank_entries API
+  async batchImportBankTransactions(
+    columns: string[],
+    data: any[][],
+    bankAccount: string
+  ): Promise<any> {
+    try {
+      return await this.callMethod(
+        'erpnext.accounts.doctype.bank_transaction.bank_transaction_upload.create_bank_entries',
+        {
+          columns: JSON.stringify(columns),
+          data: JSON.stringify(data),
+          bank_account: bankAccount
+        }
+      );
+    } catch (error: any) {
+      throw new Error(`Failed to batch import bank transactions: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  // Validate journal entry (check that debits equal credits)
+  async validateJournalEntry(journalEntry: JournalEntry): Promise<JournalEntryValidation> {
+    const validation: JournalEntryValidation = {
+      is_valid: true,
+      total_debit: 0,
+      total_credit: 0,
+      difference: 0,
+      errors: [],
+      warnings: []
+    };
+
+    // Check required fields
+    if (!journalEntry.posting_date) {
+      validation.errors.push('posting_date is required');
+      validation.is_valid = false;
+    }
+
+    if (!journalEntry.company) {
+      validation.errors.push('company is required');
+      validation.is_valid = false;
+    }
+
+    if (!journalEntry.accounts || journalEntry.accounts.length === 0) {
+      validation.errors.push('At least one account entry is required');
+      validation.is_valid = false;
+      return validation;
+    }
+
+    if (journalEntry.accounts.length < 2) {
+      validation.errors.push('Journal entry must have at least 2 account entries');
+      validation.is_valid = false;
+    }
+
+    // Calculate totals
+    for (const account of journalEntry.accounts) {
+      if (!account.account) {
+        validation.errors.push('Account name is required for all entries');
+        validation.is_valid = false;
+        continue;
+      }
+
+      const debit = account.debit_in_account_currency || 0;
+      const credit = account.credit_in_account_currency || 0;
+
+      validation.total_debit += debit;
+      validation.total_credit += credit;
+
+      // Check that each line has either debit or credit, not both
+      if (debit > 0 && credit > 0) {
+        validation.warnings.push(`Account ${account.account} has both debit and credit - this is unusual`);
+      }
+
+      if (debit === 0 && credit === 0) {
+        validation.errors.push(`Account ${account.account} has neither debit nor credit`);
+        validation.is_valid = false;
+      }
+    }
+
+    // Round to 2 decimal places for comparison
+    validation.total_debit = Math.round(validation.total_debit * 100) / 100;
+    validation.total_credit = Math.round(validation.total_credit * 100) / 100;
+    validation.difference = Math.round((validation.total_debit - validation.total_credit) * 100) / 100;
+
+    // Check if debits equal credits (allowing for small rounding errors)
+    if (Math.abs(validation.difference) > 0.01) {
+      validation.errors.push(`Debits (${validation.total_debit}) do not equal credits (${validation.total_credit}). Difference: ${validation.difference}`);
+      validation.is_valid = false;
+    }
+
+    return validation;
+  }
+
+  // Create journal entry with validation
+  async createJournalEntry(journalEntry: JournalEntry, skipValidation: boolean = false): Promise<any> {
+    try {
+      // Validate first unless skipped
+      if (!skipValidation) {
+        const validation = await this.validateJournalEntry(journalEntry);
+        if (!validation.is_valid) {
+          throw new Error(`Journal entry validation failed: ${validation.errors.join(', ')}`);
+        }
+      }
+
+      // Create the journal entry
+      const result = await this.createDocument('Journal Entry', journalEntry);
+
+      return result;
+    } catch (error: any) {
+      throw new Error(`Failed to create journal entry: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  // Submit (post) a journal entry
+  async submitJournalEntry(journalEntryName: string): Promise<any> {
+    try {
+      return await this.callMethod('frappe.client.submit', {
+        doc: JSON.stringify({
+          doctype: 'Journal Entry',
+          name: journalEntryName
+        })
+      });
+    } catch (error: any) {
+      throw new Error(`Failed to submit journal entry ${journalEntryName}: ${error?.message || 'Unknown error'}`);
     }
   }
 }
@@ -718,6 +934,133 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             }
           },
           required: ["company"]
+        }
+      },
+      {
+        name: "get_bank_accounts",
+        description: "Get list of bank accounts for a company",
+        inputSchema: {
+          type: "object",
+          properties: {
+            company: {
+              type: "string",
+              description: "Company name to filter bank accounts (optional)"
+            }
+          }
+        }
+      },
+      {
+        name: "search_bank_transactions",
+        description: "Search bank transactions with various filters for matching against EveryDollar entries or reconciliation",
+        inputSchema: {
+          type: "object",
+          properties: {
+            bank_account: {
+              type: "string",
+              description: "Bank account name to filter (optional)"
+            },
+            company: {
+              type: "string",
+              description: "Company name to filter (optional)"
+            },
+            status: {
+              type: "string",
+              description: "Transaction status: Unreconciled, Reconciled, Settled, Pending (optional)"
+            },
+            from_date: {
+              type: "string",
+              description: "Start date in YYYY-MM-DD format (optional)"
+            },
+            to_date: {
+              type: "string",
+              description: "End date in YYYY-MM-DD format (optional)"
+            },
+            min_amount: {
+              type: "number",
+              description: "Minimum transaction amount (optional)"
+            },
+            max_amount: {
+              type: "number",
+              description: "Maximum transaction amount (optional)"
+            }
+          }
+        }
+      },
+      {
+        name: "batch_import_bank_transactions",
+        description: "Batch import bank transactions from CSV/Excel data using ERPNext's create_bank_entries API",
+        inputSchema: {
+          type: "object",
+          properties: {
+            columns: {
+              type: "array",
+              items: { type: "string" },
+              description: "Column headers from CSV (e.g., ['Date', 'Deposits', 'Withdrawals', 'Description'])"
+            },
+            data: {
+              type: "array",
+              items: {
+                type: "array",
+                items: {}
+              },
+              description: "Array of data rows matching the columns"
+            },
+            bank_account: {
+              type: "string",
+              description: "Bank account name to associate transactions with"
+            }
+          },
+          required: ["columns", "data", "bank_account"]
+        }
+      },
+      {
+        name: "validate_journal_entry",
+        description: "Validate a journal entry to ensure debits equal credits before submission",
+        inputSchema: {
+          type: "object",
+          properties: {
+            journal_entry: {
+              type: "object",
+              description: "Journal entry object with posting_date, company, and accounts array"
+            }
+          },
+          required: ["journal_entry"]
+        }
+      },
+      {
+        name: "create_journal_entry",
+        description: "Create a journal entry with validation. Optionally skip validation if already validated.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            journal_entry: {
+              type: "object",
+              description: "Journal entry object with posting_date, company, accounts array, and optional user_remark"
+            },
+            skip_validation: {
+              type: "boolean",
+              description: "Skip validation if the entry was already validated (optional, defaults to false)"
+            },
+            submit: {
+              type: "boolean",
+              description: "Automatically submit (post) the journal entry after creation (optional, defaults to false)"
+            }
+          },
+          required: ["journal_entry"]
+        }
+      },
+      {
+        name: "submit_journal_entry",
+        description: "Submit (post) a draft journal entry",
+        inputSchema: {
+          type: "object",
+          properties: {
+            journal_entry_name: {
+              type: "string",
+              description: "Name/ID of the journal entry to submit (e.g., 'JV-2025-00001')"
+            }
+          },
+          required: ["journal_entry_name"]
         }
       }
     ]
@@ -1214,6 +1557,269 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: "text",
             text: `Failed to list accounts by type for ${company}: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "get_bank_accounts": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const company = request.params.arguments?.company as string | undefined;
+
+      try {
+        const accounts = await erpnext.getBankAccounts(company);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(accounts, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to get bank accounts: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "search_bank_transactions": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const bankAccount = request.params.arguments?.bank_account as string | undefined;
+      const company = request.params.arguments?.company as string | undefined;
+      const status = request.params.arguments?.status as string | undefined;
+      const fromDate = request.params.arguments?.from_date as string | undefined;
+      const toDate = request.params.arguments?.to_date as string | undefined;
+      const minAmount = request.params.arguments?.min_amount as number | undefined;
+      const maxAmount = request.params.arguments?.max_amount as number | undefined;
+
+      try {
+        const transactions = await erpnext.searchBankTransactions(
+          bankAccount,
+          company,
+          status,
+          fromDate,
+          toDate,
+          minAmount,
+          maxAmount
+        );
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(transactions, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to search bank transactions: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "batch_import_bank_transactions": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const columns = request.params.arguments?.columns as string[] | undefined;
+      const data = request.params.arguments?.data as any[][] | undefined;
+      const bankAccount = request.params.arguments?.bank_account as string | undefined;
+
+      if (!columns || !data || !bankAccount) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "columns, data, and bank_account are required"
+        );
+      }
+
+      try {
+        const result = await erpnext.batchImportBankTransactions(columns, data, bankAccount);
+        return {
+          content: [{
+            type: "text",
+            text: `Bank transactions imported successfully:\n\n${JSON.stringify(result, null, 2)}`
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to import bank transactions: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "validate_journal_entry": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const journalEntry = request.params.arguments?.journal_entry as JournalEntry | undefined;
+
+      if (!journalEntry) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "journal_entry is required"
+        );
+      }
+
+      try {
+        const validation = await erpnext.validateJournalEntry(journalEntry);
+
+        let summary = `Journal Entry Validation Result:\n\n`;
+        summary += `Valid: ${validation.is_valid ? 'Yes' : 'No'}\n`;
+        summary += `Total Debit: ${validation.total_debit.toFixed(2)}\n`;
+        summary += `Total Credit: ${validation.total_credit.toFixed(2)}\n`;
+        summary += `Difference: ${validation.difference.toFixed(2)}\n\n`;
+
+        if (validation.errors.length > 0) {
+          summary += `Errors:\n${validation.errors.map(e => `  - ${e}`).join('\n')}\n\n`;
+        }
+
+        if (validation.warnings.length > 0) {
+          summary += `Warnings:\n${validation.warnings.map(w => `  - ${w}`).join('\n')}\n`;
+        }
+
+        return {
+          content: [{
+            type: "text",
+            text: summary
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to validate journal entry: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "create_journal_entry": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const journalEntry = request.params.arguments?.journal_entry as JournalEntry | undefined;
+      const skipValidation = request.params.arguments?.skip_validation as boolean | undefined || false;
+      const submit = request.params.arguments?.submit as boolean | undefined || false;
+
+      if (!journalEntry) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "journal_entry is required"
+        );
+      }
+
+      try {
+        const result = await erpnext.createJournalEntry(journalEntry, skipValidation);
+
+        let message = `Journal Entry created successfully: ${result.name}\n\n`;
+
+        if (submit) {
+          await erpnext.submitJournalEntry(result.name);
+          message += `Journal Entry submitted (posted) successfully.\n\n`;
+        }
+
+        message += JSON.stringify(result, null, 2);
+
+        return {
+          content: [{
+            type: "text",
+            text: message
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to create journal entry: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+
+    case "submit_journal_entry": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+
+      const journalEntryName = request.params.arguments?.journal_entry_name as string | undefined;
+
+      if (!journalEntryName) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "journal_entry_name is required"
+        );
+      }
+
+      try {
+        const result = await erpnext.submitJournalEntry(journalEntryName);
+        return {
+          content: [{
+            type: "text",
+            text: `Journal Entry ${journalEntryName} submitted successfully:\n\n${JSON.stringify(result, null, 2)}`
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to submit journal entry ${journalEntryName}: ${error?.message || 'Unknown error'}`
           }],
           isError: true
         };
